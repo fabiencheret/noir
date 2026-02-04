@@ -63,64 +63,66 @@ module Noir
       max_iterations = 10000
       iterations = 0
 
-      # Track route prefixes for handling nested routers
-      prefix_stack = [] of String
-      current_prefix = ""
+      # Track router mount paths: router_variable_name => prefix_path
+      router_prefixes = Hash(String, String).new
+      router_parents = Hash(String, String).new  # For nested routers (child => parent)
+      router_variables = Set(String).new  # Track which identifiers are routers
 
-      # First pass: scan for router.use("/prefix", ...) patterns to collect prefixes
+      # First pass: scan for router.use("/prefix", routerVariable) patterns
       idx = 0
-      while idx < @tokens.size - 3
-        if (@tokens[idx].type == :identifier || @tokens[idx].value.ends_with?("Router")) &&
-           idx + 2 < @tokens.size &&
-           @tokens[idx + 1].type == :dot &&
-           (@tokens[idx + 2].value == "use" || @tokens[idx + 2].value == "register") &&
-           idx + 3 < @tokens.size &&
-           @tokens[idx + 3].type == :lparen &&
-           idx + 4 < @tokens.size &&
-           @tokens[idx + 4].type == :string
-          # Found a potential prefix in router.use("/prefix", ...)
+      while idx < @tokens.size - 6
+        # Pattern: app.use('/prefix', routerVariable) or router.use('/prefix', childRouter)
+        if (@tokens[idx].type == :identifier) &&
+           (idx + 1 < @tokens.size) && (@tokens[idx + 1].type == :dot) &&
+           (idx + 2 < @tokens.size) && (@tokens[idx + 2].value == "use" || @tokens[idx + 2].value == "register") &&
+           (idx + 3 < @tokens.size) && (@tokens[idx + 3].type == :lparen) &&
+           (idx + 4 < @tokens.size) && (@tokens[idx + 4].type == :string) &&
+           (idx + 5 < @tokens.size) && (@tokens[idx + 5].type == :comma) &&
+           (idx + 6 < @tokens.size) && (@tokens[idx + 6].type == :identifier)
+
+          parent_router = @tokens[idx].value
           prefix = @tokens[idx + 4].value
-          prefix_stack << prefix unless prefix.empty?
+          child_router = @tokens[idx + 6].value
+
+          router_prefixes[child_router] = prefix
+          router_parents[child_router] = parent_router
+          router_variables.add(child_router)
         end
         idx += 1
       end
 
-      # First, run a fast token scan to quickly capture common patterns
-      routes.concat(fast_scan_routes)
+      # Resolve full paths for nested routers by walking up the parent chain
+      router_prefixes.keys.each do |router_name|
+        full_prefix = resolve_full_prefix(router_name, router_prefixes, router_parents)
+        router_prefixes[router_name] = full_prefix
+      end
 
-      # Second pass: process routes with collected prefixes
+      # First, run a fast token scan to quickly capture common patterns
+      routes.concat(fast_scan_routes(router_prefixes))
+
+      # Second pass: process routes with other parsing methods
       while !at_end? && iterations < max_iterations
         start_position = @position
 
         # Try to parse route with current or no prefix
         route = parse_route_pattern
         if route
-          # Apply the current prefix if it exists
-          if !current_prefix.empty? && !route.path.starts_with?("/")
-            route.path = "#{current_prefix}/#{route.path}"
-          elsif !current_prefix.empty?
-            route.path = "#{current_prefix}#{route.path}"
-          end
-
           routes << route
         end
 
         # Try various route patterns for different frameworks
         route = parse_express_route_method
         if route
-          apply_prefix(route, current_prefix)
           routes << route
         end
 
         route = parse_fastify_register_route
         if route
-          apply_prefix(route, current_prefix)
           routes << route
         end
 
         route = parse_restify_apply_routes
         if route
-          apply_prefix(route, current_prefix)
           routes << route
         end
 
@@ -152,7 +154,19 @@ module Noir
         unique << r
       end
 
-      unique
+      # Filter out false positives
+      valid = [] of JSRoutePattern
+      unique.each do |route|
+        # Skip routes that are parameter-only without static prefix
+        next if is_parameter_only_route?(route.path)
+
+        # Skip routes that are just "/" with method other than GET
+        next if route.path == "/" && route.method != "GET"
+
+        valid << route
+      end
+
+      valid
     end
 
     private def apply_prefix(route : JSRoutePattern, prefix : String)
@@ -163,6 +177,77 @@ module Noir
       else
         route.path = "#{prefix}#{route.path}"
       end
+    end
+
+    # Resolve full prefix for a router by walking up the parent chain
+    private def resolve_full_prefix(router : String, router_prefixes : Hash(String, String), router_parents : Hash(String, String)) : String
+      prefix = router_prefixes[router]? || ""
+      current = router
+      visited = Set(String).new  # Track visited routers to prevent infinite loops
+
+      # Walk up parent chain
+      while parent = router_parents[current]?
+        break if visited.includes?(current)  # Prevent infinite loops
+        visited.add(current)
+
+        parent_prefix = router_prefixes[parent]? || ""
+
+        # Concatenate paths properly
+        if !parent_prefix.empty?
+          prefix = join_paths(parent_prefix, prefix)
+        end
+
+        current = parent
+      end
+
+      prefix
+    end
+
+    # Helper to join two path segments properly
+    private def join_paths(parent : String, child : String) : String
+      return child if parent.empty?
+      return parent if child.empty?
+
+      if parent.ends_with?("/") && child.starts_with?("/")
+        "#{parent[0..-2]}#{child}"
+      elsif !parent.ends_with?("/") && !child.starts_with?("/")
+        "#{parent}/#{child}"
+      else
+        "#{parent}#{child}"
+      end
+    end
+
+    # Check if a route is parameter-only without any static prefix
+    private def is_parameter_only_route?(path : String) : Bool
+      # Routes like "/:userId" or "/:postId" without any static prefix
+      return true if path =~ /^\/:[^\/]+$/
+      false
+    end
+
+    # Extract array paths from array syntax: ['/path1', '/path2', /regex/]
+    private def extract_array_paths(start_idx : Int32) : Array(String)
+      paths = [] of String
+      return paths unless start_idx < @tokens.size && @tokens[start_idx].type == :lbracket
+
+      idx = start_idx + 1
+      while idx < @tokens.size && @tokens[idx].type != :rbracket
+        token = @tokens[idx]
+
+        if token.type == :string
+          paths << token.value
+        elsif token.type == :regex
+          paths << "/#{token.value}/"
+        elsif token.type == :identifier || token.type == :template_literal
+          resolved = resolve_dynamic_path(idx)
+          paths << resolved if resolved
+        end
+
+        idx += 1
+        # Skip commas
+        idx += 1 if idx < @tokens.size && @tokens[idx].type == :comma
+      end
+
+      paths
     end
 
     private def current_token
@@ -216,7 +301,7 @@ module Noir
     end
 
     # Fast path: scan tokens for the most common route patterns without full parsing
-    private def fast_scan_routes : Array(JSRoutePattern)
+    private def fast_scan_routes(router_prefixes : Hash(String, String) = Hash(String, String).new) : Array(JSRoutePattern)
       results = [] of JSRoutePattern
 
       idx = 0
@@ -228,20 +313,40 @@ module Noir
            @tokens[idx + 1].type == :dot &&
            @tokens[idx + 2].type == :http_method &&
            @tokens[idx + 3].type == :lparen
+          router_var = @tokens[idx].value
           method = @tokens[idx + 2].value
           # read path at idx+4
           path_token = @tokens[idx + 4]
-          path = nil
-          if path_token.type == :string || path_token.type == :template_literal || path_token.type == :identifier
+          paths = [] of String
+
+          if path_token.type == :lbracket
+            # Handle array of paths
+            paths = extract_array_paths(idx + 4)
+          elsif path_token.type == :string || path_token.type == :template_literal || path_token.type == :identifier
             path = resolve_dynamic_path(idx + 4)
             path ||= (path_token.type == :string ? path_token.value : nil)
+            paths = [path] if path
+          elsif path_token.type == :regex
+            # Store raw regex pattern with delimiters
+            path = "/#{path_token.value}/"
+            paths = [path]
           end
 
-          if path
+          # Create one route for each path
+          paths.each do |path|
+            # Apply router prefix if this router has one
+            if router_prefixes.has_key?(router_var)
+              prefix = router_prefixes[router_var]
+              path = join_paths(prefix, path)
+            end
+
             m = method.upcase
             m = "DELETE" if m.downcase == "del"
             route = JSRoutePattern.new(m, path)
-            extract_path_params(path).each { |p| route.push_param(p) }
+            # Only extract path params from non-regex patterns
+            unless path.starts_with?("/") && path.includes?("(") && path.includes?(")")
+              extract_path_params(path).each { |p| route.push_param(p) }
+            end
             results << route
           end
 
@@ -249,22 +354,36 @@ module Noir
           next
         end
 
-        # Pattern 2: identifier . route ( 'path' | `tpl` | ident ) . http_method ... (chained)
+        # Pattern 2: identifier . route ( 'path' | `tpl` | ident | [ ] ) . http_method ... (chained)
         if @tokens[idx].type == :identifier &&
            @tokens[idx + 1].type == :dot &&
            @tokens[idx + 2].value == "route" &&
            @tokens[idx + 3].type == :lparen
+          router_var = @tokens[idx].value
           # resolve path at idx+4
-          path = nil
+          paths = [] of String
           if idx + 4 < limit
             t = @tokens[idx + 4]
-            if t.type == :string || t.type == :template_literal || t.type == :identifier
+            if t.type == :lbracket
+              # Handle array of paths
+              paths = extract_array_paths(idx + 4)
+            elsif t.type == :string || t.type == :template_literal || t.type == :identifier
               path = resolve_dynamic_path(idx + 4)
               path ||= (t.type == :string ? t.value : nil)
+              paths = [path] if path
+            elsif t.type == :regex
+              paths = ["/#{t.value}/"]
             end
           end
 
-          if path
+          paths.each do |base_path|
+            path = base_path
+            # Apply router prefix if this router has one
+            if router_prefixes.has_key?(router_var)
+              prefix = router_prefixes[router_var]
+              path = join_paths(prefix, path)
+            end
+
             # look ahead bounded to avoid O(n^2)
             j = idx + 5
             steps = 0
@@ -274,7 +393,10 @@ module Noir
                 m = @tokens[j + 1].value.upcase
                 m = "DELETE" if m.downcase == "del"
                 route = JSRoutePattern.new(m, path)
-                extract_path_params(path).each { |p| route.push_param(p) }
+                # Only extract path params from non-regex patterns
+                unless path.starts_with?("/") && path.includes?("(") && path.includes?(")")
+                  extract_path_params(path).each { |p| route.push_param(p) }
+                end
                 results << route
                 j += 2
                 steps += 2
@@ -339,6 +461,10 @@ module Noir
           # Check for regular string
           if @tokens[path_idx + 1].type == :string
             path = @tokens[path_idx + 1].value
+            @position = path_idx + 2
+          elsif @tokens[path_idx + 1].type == :regex
+            # Handle regex route path
+            path = "/#{@tokens[path_idx + 1].value}/"
             @position = path_idx + 2
             # Check for template literal or dynamic path construction
           elsif @tokens[path_idx + 1].type == :template_literal ||

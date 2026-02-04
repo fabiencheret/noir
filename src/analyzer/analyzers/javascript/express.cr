@@ -14,6 +14,9 @@ module Analyzer::Javascript
       static_dirs = [] of Hash(String, String)
 
       begin
+        # Phase 1: Pre-scan to build router mount map
+        scan_for_router_mounts
+
         populate_channel_with_files(channel)
 
         WaitGroup.wait do |wg|
@@ -905,6 +908,111 @@ module Analyzer::Javascript
       Noir::JSRouteExtractor.extract_body_params(handler_body, endpoint)
       Noir::JSRouteExtractor.extract_header_params(handler_body, endpoint)
       Noir::JSRouteExtractor.extract_cookie_params(handler_body, endpoint)
+    end
+
+    # Scan for router mount patterns and store them in CodeLocator
+    # This enables cross-file router prefix tracking
+    private def scan_for_router_mounts
+      locator = CodeLocator.instance
+
+      # Find potential main files (server.js, app.js, index.js, main.js)
+      main_files = [] of String
+      ["server.js", "app.js", "index.js", "main.js", "server.ts", "app.ts", "index.ts", "main.ts"].each do |filename|
+        potential_path = File.join(base_path, filename)
+        main_files << potential_path if File.exists?(potential_path)
+
+        # Also check in common subdirectories
+        ["src", "lib", "app"].each do |subdir|
+          subdir_path = File.join(base_path, subdir, filename)
+          main_files << subdir_path if File.exists?(subdir_path)
+        end
+      end
+
+      # Scan each main file for router mount patterns
+      main_files.each do |main_file|
+        begin
+          content = File.read(main_file, encoding: "utf-8", invalid: :skip)
+
+          # Track require/import statements to map variable names to file paths
+          # Pattern: const varName = require('./path/to/file')
+          require_map = Hash(String, String).new
+
+          content.scan(/(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/) do |m|
+            if m.size >= 3
+              var_name = m[1]
+              require_path = m[2]
+              # Resolve relative paths
+              resolved_path = resolve_require_path(main_file, require_path)
+              require_map[var_name] = resolved_path if resolved_path
+            end
+          end
+
+          # Pattern: import varName from './path/to/file'
+          content.scan(/import\s+(\w+)\s+from\s+['"]([^'"]+)['"]/) do |m|
+            if m.size >= 3
+              var_name = m[1]
+              require_path = m[2]
+              resolved_path = resolve_require_path(main_file, require_path)
+              require_map[var_name] = resolved_path if resolved_path
+            end
+          end
+
+          # Now scan for app.use('/prefix', routerVar) patterns
+          content.scan(/(?:app|router)\.use\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\w+)/) do |m|
+            if m.size >= 3
+              prefix = m[1]
+              router_var = m[2]
+
+              # Look up the file path for this router variable
+              if router_file = require_map[router_var]?
+                # Store in CodeLocator with key format: "express_router_prefix:<file_path>"
+                locator.set("express_router_prefix:#{router_file}", prefix)
+                logger.debug "Mapped router prefix: #{router_file} => #{prefix}"
+              end
+            end
+          end
+
+          # Also handle inline require: app.use('/prefix', require('./path'))
+          content.scan(/(?:app|router)\.use\s*\(\s*['"]([^'"]+)['"]\s*,\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/) do |m|
+            if m.size >= 3
+              prefix = m[1]
+              require_path = m[2]
+              resolved_path = resolve_require_path(main_file, require_path)
+
+              if resolved_path
+                locator.set("express_router_prefix:#{resolved_path}", prefix)
+                logger.debug "Mapped router prefix (inline): #{resolved_path} => #{prefix}"
+              end
+            end
+          end
+        rescue e
+          logger.debug "Error scanning #{main_file} for router mounts: #{e.message}"
+        end
+      end
+    end
+
+    # Resolve a require path relative to the requiring file
+    private def resolve_require_path(from_file : String, require_path : String) : String?
+      return nil if require_path.starts_with?(".")  == false  # Skip node_modules
+
+      base_dir = File.dirname(from_file)
+      resolved = File.expand_path(require_path, base_dir)
+
+      # Try with common extensions if file doesn't exist
+      return resolved if File.exists?(resolved)
+
+      [".js", ".ts", ".jsx", ".tsx"].each do |ext|
+        with_ext = "#{resolved}#{ext}"
+        return with_ext if File.exists?(with_ext)
+      end
+
+      # Try as directory with index file
+      ["index.js", "index.ts", "index.jsx", "index.tsx"].each do |index_file|
+        index_path = File.join(resolved, index_file)
+        return index_path if File.exists?(index_path)
+      end
+
+      nil
     end
   end
 end

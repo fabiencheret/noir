@@ -1,6 +1,7 @@
 require "../models/endpoint"
 require "../minilexers/js_lexer"
 require "../miniparsers/js_parser"
+require "../models/code_locator"
 
 module Noir
   # JSRouteExtractor provides a unified interface for extracting routes from JavaScript files
@@ -17,8 +18,23 @@ module Noir
           STDERR.puts "Warning: Maximum iterations reached in JS parser, parsing may be incomplete"
         end
 
+        # Check if this file has a router prefix from cross-file mounting
+        locator = CodeLocator.instance
+
+        # Normalize file path to absolute path for consistent lookup
+        absolute_file_path = File.expand_path(file_path)
+        lookup_key = "express_router_prefix:#{absolute_file_path}"
+        file_prefix_value = locator.get(lookup_key)
+        file_prefix = file_prefix_value.is_a?(String) && !file_prefix_value.empty? ? file_prefix_value : nil
+
         endpoints = [] of Endpoint
         route_patterns.each do |pattern|
+          # Apply cross-file router prefix if present
+          path_with_prefix = pattern.path
+          if file_prefix && !file_prefix.empty?
+            path_with_prefix = join_paths(file_prefix, pattern.path)
+          end
+
           # Normalize HTTP method (e.g., DEL -> DELETE)
           normalized_method = normalize_http_method(pattern.method)
 
@@ -26,7 +42,7 @@ module Noir
           if normalized_method == "ALL"
             all_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
             all_methods.each do |method|
-              endpoint = Endpoint.new(pattern.path, method)
+              endpoint = Endpoint.new(path_with_prefix, method)
 
               # Add path parameters detected in the URL
               pattern.params.each do |param|
@@ -39,7 +55,7 @@ module Noir
               endpoints << endpoint
             end
           else
-            endpoint = Endpoint.new(pattern.path, normalized_method)
+            endpoint = Endpoint.new(path_with_prefix, normalized_method)
 
             # Add path parameters detected in the URL
             pattern.params.each do |param|
@@ -57,6 +73,20 @@ module Noir
       rescue e
         # If parser fails, return empty array
         [] of Endpoint
+      end
+    end
+
+    # Helper to join two path segments properly
+    def self.join_paths(parent : String, child : String) : String
+      return child if parent.empty?
+      return parent if child.empty?
+
+      if parent.ends_with?("/") && child.starts_with?("/")
+        "#{parent[0..-2]}#{child}"
+      elsif !parent.ends_with?("/") && !child.starts_with?("/")
+        "#{parent}/#{child}"
+      else
+        "#{parent}#{child}"
       end
     end
 
