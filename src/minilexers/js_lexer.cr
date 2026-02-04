@@ -258,14 +258,16 @@ module Noir
       advance if @current_char == '/'  # Skip closing /
 
       # Read regex flags (g, i, m, s, u, y)
+      regex_flags = ""
       while @current_char == 'g' || @current_char == 'i' ||
             @current_char == 'm' || @current_char == 's' ||
             @current_char == 'u' || @current_char == 'y'
-        regex_pattern += @current_char
+        regex_flags += @current_char
         advance
       end
 
-      add_token(:regex, regex_pattern)
+      # Store pattern and flags separately to preserve regex form
+      add_token(:regex, "#{regex_pattern}\n#{regex_flags}")
     end
   end
 end

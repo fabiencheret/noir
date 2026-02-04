@@ -26,6 +26,7 @@ module Noir
     @constants : Hash(String, String) = {} of String => String
     @current_route_path : String? = nil
     @current_route_start_idx : Int32? = nil
+    @router_prefixes : Hash(String, String) = {} of String => String
 
     def initialize(source : String)
       lexer = JSLexer.new(source)
@@ -97,6 +98,8 @@ module Noir
         router_prefixes[router_name] = full_prefix
       end
 
+      @router_prefixes = router_prefixes
+
       # First, run a fast token scan to quickly capture common patterns
       routes.concat(fast_scan_routes(router_prefixes))
 
@@ -154,19 +157,7 @@ module Noir
         unique << r
       end
 
-      # Filter out false positives
-      valid = [] of JSRoutePattern
-      unique.each do |route|
-        # Skip routes that are parameter-only without static prefix
-        next if is_parameter_only_route?(route.path)
-
-        # Skip routes that are just "/" with method other than GET
-        next if route.path == "/" && route.method != "GET"
-
-        valid << route
-      end
-
-      valid
+      unique
     end
 
     private def apply_prefix(route : JSRoutePattern, prefix : String)
@@ -217,11 +208,13 @@ module Noir
       end
     end
 
-    # Check if a route is parameter-only without any static prefix
-    private def is_parameter_only_route?(path : String) : Bool
-      # Routes like "/:userId" or "/:postId" without any static prefix
-      return true if path =~ /^\/:[^\/]+$/
-      false
+    private def format_regex_path(value : String) : String
+      parts = value.split("\n", 2)
+      pattern = parts[0]
+      flags = parts.size > 1 ? parts[1] : ""
+
+      return "/#{pattern}/#{flags}" unless flags.empty?
+      "/#{pattern}/"
     end
 
     # Extract array paths from array syntax: ['/path1', '/path2', /regex/]
@@ -236,7 +229,7 @@ module Noir
         if token.type == :string
           paths << token.value
         elsif token.type == :regex
-          paths << "/#{token.value}/"
+          paths << format_regex_path(token.value)
         elsif token.type == :identifier || token.type == :template_literal
           resolved = resolve_dynamic_path(idx)
           paths << resolved if resolved
@@ -327,8 +320,7 @@ module Noir
             path ||= (path_token.type == :string ? path_token.value : nil)
             paths = [path] if path
           elsif path_token.type == :regex
-            # Store raw regex pattern with delimiters
-            path = "/#{path_token.value}/"
+            path = format_regex_path(path_token.value)
             paths = [path]
           end
 
@@ -372,7 +364,7 @@ module Noir
               path ||= (t.type == :string ? t.value : nil)
               paths = [path] if path
             elsif t.type == :regex
-              paths = ["/#{t.value}/"]
+              paths = [format_regex_path(t.value)]
             end
           end
 
@@ -464,7 +456,7 @@ module Noir
             @position = path_idx + 2
           elsif @tokens[path_idx + 1].type == :regex
             # Handle regex route path
-            path = "/#{@tokens[path_idx + 1].value}/"
+            path = format_regex_path(@tokens[path_idx + 1].value)
             @position = path_idx + 2
             # Check for template literal or dynamic path construction
           elsif @tokens[path_idx + 1].type == :template_literal ||
@@ -486,6 +478,12 @@ module Noir
           end
 
           if path
+            router_var = @tokens[idx].value
+            if @router_prefixes.has_key?(router_var)
+              prefix = @router_prefixes[router_var]
+              path = join_paths(prefix, path)
+            end
+
             # Extract parameters from path
             route = JSRoutePattern.new(method, path)
             extract_path_params(path).each do |param|
@@ -639,6 +637,14 @@ module Noir
           end
 
           if path
+            if @tokens[idx - 1].type == :identifier
+              router_var = @tokens[idx - 1].value
+              if @router_prefixes.has_key?(router_var)
+                prefix = @router_prefixes[router_var]
+                path = join_paths(prefix, path)
+              end
+            end
+
             # Extract parameters from path
             route = JSRoutePattern.new(method, path)
             extract_path_params(path).each do |param|
@@ -722,6 +728,11 @@ module Noir
          idx + 4 < @tokens.size &&
          @tokens[idx + 4].type == :string
         path = @tokens[idx + 4].value
+        router_var = @tokens[idx].value
+        if @router_prefixes.has_key?(router_var)
+          prefix = @router_prefixes[router_var]
+          path = join_paths(prefix, path)
+        end
 
         # Look for method chaining after .route('/path')
         method_idx = idx + 6 # Skip past string and closing paren
