@@ -936,6 +936,9 @@ module Analyzer::Javascript
           # Track require/import statements to map variable names to file paths
           # Pattern: const varName = require('./path/to/file')
           require_map = Hash(String, String).new
+          function_map = Hash(String, String).new
+          var_to_function = Hash(String, String).new
+          var_prefix = Hash(String, String).new
 
           content.scan(/(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/) do |m|
             if m.size >= 3
@@ -944,6 +947,29 @@ module Analyzer::Javascript
               # Resolve relative paths
               resolved_path = resolve_require_path(main_file, require_path)
               require_map[var_name] = resolved_path if resolved_path
+            end
+          end
+
+          # Pattern: const { funcA, funcB: aliasB } = require('./path/to/file')
+          content.scan(/(?:const|let|var)\s*\{\s*([^}]+)\s*\}\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/) do |m|
+            if m.size >= 3
+              names = m[1]
+              require_path = m[2]
+              resolved_path = resolve_require_path(main_file, require_path)
+              if resolved_path
+                names.split(",").each do |name|
+                  cleaned = name.strip
+                  next if cleaned.empty?
+                  if cleaned.includes?(" as ")
+                    parts = cleaned.split(/\s+as\s+/, 2)
+                    cleaned = parts.size == 2 ? parts[1].strip : cleaned
+                  elsif cleaned.includes?(":")
+                    parts = cleaned.split(":", 2)
+                    cleaned = parts.size == 2 ? parts[1].strip : cleaned
+                  end
+                  function_map[cleaned] = resolved_path unless cleaned.empty?
+                end
+              end
             end
           end
 
@@ -957,23 +983,136 @@ module Analyzer::Javascript
             end
           end
 
-          # Now scan for app.use('/prefix', routerVar) patterns
-          content.scan(/(?:app|router)\.use\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\w+)/) do |m|
+          # Pattern: import { funcA, funcB as aliasB } from './path/to/file'
+          content.scan(/import\s*\{\s*([^}]+)\s*\}\s*from\s*['"]([^'"]+)['"]/) do |m|
             if m.size >= 3
-              prefix = m[1]
-              router_var = m[2]
+              names = m[1]
+              require_path = m[2]
+              resolved_path = resolve_require_path(main_file, require_path)
+              if resolved_path
+                names.split(",").each do |name|
+                  cleaned = name.strip
+                  next if cleaned.empty?
+                  if cleaned.includes?(" as ")
+                    parts = cleaned.split(/\s+as\s+/, 2)
+                    cleaned = parts.size == 2 ? parts[1].strip : cleaned
+                  elsif cleaned.includes?(":")
+                    parts = cleaned.split(":", 2)
+                    cleaned = parts.size == 2 ? parts[1].strip : cleaned
+                  end
+                  function_map[cleaned] = resolved_path unless cleaned.empty?
+                end
+              end
+            end
+          end
 
-              # Look up the file path for this router variable
-              if router_file = require_map[router_var]?
-                # Store in CodeLocator with key format: "express_router_prefix:<file_path>"
-                locator.set("express_router_prefix:#{router_file}", prefix)
-                logger.debug "Mapped router prefix: #{router_file} => #{prefix}"
+          # Pattern: const varName = functionName()
+          content.scan(/(?:const|let|var)\s+(\w+)\s*=\s*(\w+)\s*\(\s*\)/) do |m|
+            if m.size >= 3
+              var_name = m[1]
+              func_name = m[2]
+              if function_map.has_key?(func_name)
+                var_to_function[var_name] = func_name
+              end
+            end
+          end
+
+          # Now scan for app.use('/prefix', routerVar) patterns
+          content.scan(/(\w+)\.use\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\w+)/) do |m|
+            if m.size >= 4
+              caller = m[1]
+              prefix = m[2]
+              router_var = m[3]
+
+              # Only treat app/router as top-level mounts
+              if caller == "app" || caller == "router"
+                # Look up the file path for this router variable
+                if router_file = require_map[router_var]?
+                  # Store in CodeLocator with key format: "express_router_prefix:<file_path>"
+                  locator.set("express_router_prefix:#{router_file}", prefix)
+                  logger.debug "Mapped router prefix: #{router_file} => #{prefix}"
+                  var_prefix[router_var] = prefix
+                elsif func_name = var_to_function[router_var]?
+                  if router_file = function_map[func_name]?
+                    locator.push("express_router_prefix:#{router_file}:#{func_name}", prefix)
+                    logger.debug "Mapped router prefix (factory var): #{router_file}:#{func_name} => #{prefix}"
+                    var_prefix[router_var] = prefix
+                  end
+                elsif router_file = function_map[router_var]?
+                  locator.push("express_router_prefix:#{router_file}:#{router_var}", prefix)
+                  logger.debug "Mapped router prefix (factory direct): #{router_file}:#{router_var} => #{prefix}"
+                  var_prefix[router_var] = prefix
+                end
+              else
+                # Nested mounts: parent router variable should already have a prefix
+                parent_prefix = var_prefix[caller]?
+                if parent_prefix
+                  if func_name = var_to_function[router_var]?
+                    if router_file = function_map[func_name]?
+                      combined = if parent_prefix.ends_with?("/") && prefix.starts_with?("/")
+                                   "#{parent_prefix[0..-2]}#{prefix}"
+                                 elsif !parent_prefix.ends_with?("/") && !prefix.starts_with?("/")
+                                   "#{parent_prefix}/#{prefix}"
+                                 else
+                                   "#{parent_prefix}#{prefix}"
+                                 end
+                      locator.push("express_router_prefix:#{router_file}:#{func_name}", combined)
+                      logger.debug "Mapped nested router prefix: #{router_file}:#{func_name} => #{combined}"
+                    end
+                  elsif router_file = function_map[router_var]?
+                    combined = if parent_prefix.ends_with?("/") && prefix.starts_with?("/")
+                                 "#{parent_prefix[0..-2]}#{prefix}"
+                               elsif !parent_prefix.ends_with?("/") && !prefix.starts_with?("/")
+                                 "#{parent_prefix}/#{prefix}"
+                               else
+                                 "#{parent_prefix}#{prefix}"
+                               end
+                    locator.push("express_router_prefix:#{router_file}:#{router_var}", combined)
+                    logger.debug "Mapped nested router prefix: #{router_file}:#{router_var} => #{combined}"
+                  end
+                end
+              end
+            end
+          end
+
+          # Handle inline factory call: app.use('/prefix', createRouter())
+          content.scan(/(\w+)\.use\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\w+)\s*\(\s*\)\s*\)/) do |m|
+            if m.size >= 4
+              caller = m[1]
+              prefix = m[2]
+              func_name = m[3]
+              if (caller == "app" || caller == "router") && (router_file = function_map[func_name]?)
+                locator.push("express_router_prefix:#{router_file}:#{func_name}", prefix)
+                logger.debug "Mapped router prefix (inline factory): #{router_file}:#{func_name} => #{prefix}"
+              end
+            end
+          end
+
+          # Handle nested router factories with parent prefix: parent.use('/sub', createChild())
+          content.scan(/(\w+)\.use\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\w+)\s*\(\s*\)\s*\)/) do |m|
+            if m.size >= 4
+              parent_var = m[1]
+              child_func = m[3]
+              child_prefix = m[2]
+              parent_prefix = var_prefix[parent_var]?
+              router_file = function_map[child_func]?
+
+              if parent_prefix && router_file
+                combined = if parent_prefix.ends_with?("/") && child_prefix.starts_with?("/")
+                             "#{parent_prefix[0..-2]}#{child_prefix}"
+                           elsif !parent_prefix.ends_with?("/") && !child_prefix.starts_with?("/")
+                             "#{parent_prefix}/#{child_prefix}"
+                           else
+                             "#{parent_prefix}#{child_prefix}"
+                           end
+                locator.push("express_router_prefix:#{router_file}:#{child_func}", combined)
+                logger.debug "Mapped nested router prefix: #{router_file}:#{child_func} => #{combined}"
               end
             end
           end
 
           # Also handle inline require: app.use('/prefix', require('./path'))
-          content.scan(/(?:app|router)\.use\s*\(\s*['"]([^'"]+)['"]\s*,\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/) do |m|
+          content.scan(/(?:app|router|\w+)\.use\s*\(\s*['"]([^'"]+)['"]\s*,\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/) do |m|
             if m.size >= 3
               prefix = m[1]
               require_path = m[2]
