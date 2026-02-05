@@ -915,16 +915,26 @@ module Analyzer::Javascript
     private def scan_for_router_mounts
       locator = CodeLocator.instance
 
-      # Find potential main files (server.js, app.js, index.js, main.js)
+      # Prefer scanning all JS/TS files discovered by the detector (file_map) to avoid missing mounts.
       main_files = [] of String
-      ["server.js", "app.js", "index.js", "main.js", "server.ts", "app.ts", "index.ts", "main.ts"].each do |filename|
-        potential_path = File.join(base_path, filename)
-        main_files << potential_path if File.exists?(potential_path)
+      all_files.each do |file|
+        next if File.directory?(file)
+        next unless [".js", ".ts", ".jsx", ".tsx"].any? { |ext| file.ends_with?(ext) }
+        next unless @base_paths.any? { |base| file.starts_with?(base) }
+        main_files << file
+      end
 
-        # Also check in common subdirectories
-        ["src", "lib", "app"].each do |subdir|
-          subdir_path = File.join(base_path, subdir, filename)
-          main_files << subdir_path if File.exists?(subdir_path)
+      # Fallback: if file_map is empty, scan common entrypoints only.
+      if main_files.empty?
+        ["server.js", "app.js", "index.js", "main.js", "server.ts", "app.ts", "index.ts", "main.ts"].each do |filename|
+          potential_path = File.join(base_path, filename)
+          main_files << potential_path if File.exists?(potential_path)
+
+          # Also check in common subdirectories
+          ["src", "lib", "app"].each do |subdir|
+            subdir_path = File.join(base_path, subdir, filename)
+            main_files << subdir_path if File.exists?(subdir_path)
+          end
         end
       end
 
