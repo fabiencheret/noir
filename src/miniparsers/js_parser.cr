@@ -7,9 +7,12 @@ module Noir
   class JSRoutePattern
     getter method : String
     property path : String
+    getter raw_path : String
+    getter start_pos : Int32
     getter params : Array(Param)
 
-    def initialize(@method : String, @path : String)
+    def initialize(@method : String, @path : String, raw_path : String? = nil, @start_pos : Int32 = -1)
+      @raw_path = raw_path || @path
       @params = [] of Param
     end
 
@@ -26,6 +29,8 @@ module Noir
     @constants : Hash(String, String) = {} of String => String
     @current_route_path : String? = nil
     @current_route_start_idx : Int32? = nil
+    @current_route_raw_path : String? = nil
+    @current_route_start_pos : Int32? = nil
     @router_prefixes : Hash(String, String) = {} of String => String
 
     def initialize(source : String)
@@ -151,7 +156,7 @@ module Noir
       seen = Set(String).new
       unique = [] of JSRoutePattern
       routes.each do |r|
-        key = r.method + "\u0000" + r.path
+        key = r.method + "\u0000" + r.path + "\u0000" + r.start_pos.to_s
         next if seen.includes?(key)
         seen.add(key)
         unique << r
@@ -198,6 +203,7 @@ module Noir
     private def join_paths(parent : String, child : String) : String
       return child if parent.empty?
       return parent if child.empty?
+      return parent if child == "/"
 
       if parent.ends_with?("/") && child.starts_with?("/")
         "#{parent[0..-2]}#{child}"
@@ -326,6 +332,8 @@ module Noir
 
           # Create one route for each path
           paths.each do |path|
+            raw_path = path
+            start_pos = @tokens[idx].position
             # Apply router prefix if this router has one
             if router_prefixes.has_key?(router_var)
               prefix = router_prefixes[router_var]
@@ -334,7 +342,7 @@ module Noir
 
             m = method.upcase
             m = "DELETE" if m.downcase == "del"
-            route = JSRoutePattern.new(m, path)
+            route = JSRoutePattern.new(m, path, raw_path, start_pos)
             # Only extract path params from non-regex patterns
             unless path.starts_with?("/") && path.includes?("(") && path.includes?(")")
               extract_path_params(path).each { |p| route.push_param(p) }
@@ -370,6 +378,8 @@ module Noir
 
           paths.each do |base_path|
             path = base_path
+            raw_path = base_path
+            start_pos = @tokens[idx].position
             # Apply router prefix if this router has one
             if router_prefixes.has_key?(router_var)
               prefix = router_prefixes[router_var]
@@ -384,7 +394,7 @@ module Noir
               if @tokens[j].type == :dot && @tokens[j + 1].type == :http_method
                 m = @tokens[j + 1].value.upcase
                 m = "DELETE" if m.downcase == "del"
-                route = JSRoutePattern.new(m, path)
+                route = JSRoutePattern.new(m, path, raw_path, start_pos)
                 # Only extract path params from non-regex patterns
                 unless path.starts_with?("/") && path.includes?("(") && path.includes?(")")
                   extract_path_params(path).each { |p| route.push_param(p) }
@@ -479,13 +489,15 @@ module Noir
 
           if path
             router_var = @tokens[idx].value
+            raw_path = path
+            start_pos = @tokens[idx].position
             if @router_prefixes.has_key?(router_var)
               prefix = @router_prefixes[router_var]
               path = join_paths(prefix, path)
             end
 
             # Extract parameters from path
-            route = JSRoutePattern.new(method, path)
+            route = JSRoutePattern.new(method, path, raw_path, start_pos)
             extract_path_params(path).each do |param|
               route.push_param(param)
             end
@@ -524,7 +536,8 @@ module Noir
           @position = path_idx + 2
 
           # Extract parameters from path
-          route = JSRoutePattern.new(method, path)
+          start_pos = @tokens[idx].position
+          route = JSRoutePattern.new(method, path, nil, start_pos)
           extract_path_params(path).each do |param|
             route.push_param(param)
           end
@@ -583,7 +596,8 @@ module Noir
 
           # If we found a path, create a route object
           if path
-            route = JSRoutePattern.new(method, path)
+            start_pos = @tokens[idx].position
+            route = JSRoutePattern.new(method, path, nil, start_pos)
             extract_path_params(path).each do |param|
               route.push_param(param)
             end
@@ -637,6 +651,8 @@ module Noir
           end
 
           if path
+            raw_path = path
+            start_pos = @tokens[idx].position
             if @tokens[idx - 1].type == :identifier
               router_var = @tokens[idx - 1].value
               if @router_prefixes.has_key?(router_var)
@@ -646,7 +662,7 @@ module Noir
             end
 
             # Extract parameters from path
-            route = JSRoutePattern.new(method, path)
+            route = JSRoutePattern.new(method, path, raw_path, start_pos)
             extract_path_params(path).each do |param|
               route.push_param(param)
             end
@@ -692,7 +708,9 @@ module Noir
 
             # Create a route for this HTTP method
             path = @current_route_path.as(String)
-            route = JSRoutePattern.new(method, path)
+            raw_path = @current_route_raw_path || path
+            start_pos = @current_route_start_pos || @tokens[@current_route_start_idx.as(Int32)].position
+            route = JSRoutePattern.new(method, path, raw_path, start_pos)
             extract_path_params(path).each do |param|
               route.push_param(param)
             end
@@ -712,6 +730,8 @@ module Noir
         # No more methods found in chain, reset
         @current_route_path = nil
         @current_route_start_idx = nil
+        @current_route_raw_path = nil
+        @current_route_start_pos = nil
       end
 
       # Look for a new route() declaration - only at the current position
@@ -729,6 +749,8 @@ module Noir
          @tokens[idx + 4].type == :string
         path = @tokens[idx + 4].value
         router_var = @tokens[idx].value
+        raw_path = path
+        start_pos = @tokens[idx].position
         if @router_prefixes.has_key?(router_var)
           prefix = @router_prefixes[router_var]
           path = join_paths(prefix, path)
@@ -743,7 +765,7 @@ module Noir
             method = @tokens[method_idx + 1].value.upcase
 
             # Create a route for this HTTP method
-            route = JSRoutePattern.new(method, path)
+            route = JSRoutePattern.new(method, path, raw_path, start_pos)
             extract_path_params(path).each do |param|
               route.push_param(param)
             end
@@ -751,6 +773,8 @@ module Noir
             # Set up for chain continuation
             @current_route_path = path
             @current_route_start_idx = idx
+            @current_route_raw_path = raw_path
+            @current_route_start_pos = start_pos
             @position = method_idx + 2 # Move past dot and method
             return route
           elsif @tokens[method_idx].type == :semicolon
@@ -806,9 +830,11 @@ module Noir
                @tokens[ahead_idx + 4].type == :string
               method = @tokens[ahead_idx + 2].value.upcase
               path = @tokens[ahead_idx + 4].value
+              start_pos = @tokens[ahead_idx].position
 
               # Create route with the prefix
-              route = JSRoutePattern.new(method, "#{prefix}#{path}")
+              raw_path = path
+              route = JSRoutePattern.new(method, "#{prefix}#{path}", raw_path, start_pos)
               extract_path_params(path).each do |param|
                 route.push_param(param)
               end
@@ -863,9 +889,11 @@ module Noir
 
             path = @tokens[back_idx + 2].value
             full_path = prefix.empty? ? path : "#{prefix}#{path}"
+            start_pos = @tokens[back_idx - 2].position
 
             # Create route with the prefix
-            route = JSRoutePattern.new(method, full_path)
+            raw_path = path
+            route = JSRoutePattern.new(method, full_path, raw_path, start_pos)
             extract_path_params(path).each do |param|
               route.push_param(param)
             end
